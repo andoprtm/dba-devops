@@ -1,0 +1,86 @@
+-- BASIC INFO
+SELECT version();
+SELECT now() - pg_postmaster_start_time() AS uptime;
+
+-- CONNECTIONS
+SHOW max_connections;
+SELECT count(*) AS current_connections,
+       (SELECT setting::int FROM pg_settings WHERE name='max_connections') AS max_connections
+FROM pg_stat_activity;
+
+-- DATABASE SIZE
+SELECT datname, pg_size_pretty(pg_database_size(datname)) AS size
+FROM pg_database
+ORDER BY pg_database_size(datname) DESC;
+
+-- CACHE HIT RATIO
+SELECT datname,
+       blks_hit * 100 / nullif(blks_hit + blks_read,0) AS cache_hit_ratio
+FROM pg_stat_database
+ORDER BY cache_hit_ratio ASC;
+
+-- LONG RUNNING QUERIES (>5min)
+SELECT pid, usename, state, query, now() - query_start AS duration
+FROM pg_stat_activity
+WHERE state <> 'idle'
+  AND now() - query_start > interval '5 minutes'
+ORDER BY duration DESC;
+
+-- BLOCKING QUERIES
+SELECT bl.pid AS blocked_pid,
+       ka.query AS blocking_query,
+       now() - ka.query_start AS blocking_duration,
+       kl.pid AS blocking_pid,
+       a.query AS blocked_query,
+       now() - a.query_start AS blocked_duration
+FROM pg_locks bl
+JOIN pg_stat_activity a ON a.pid = bl.pid
+JOIN pg_locks kl ON kl.transactionid = bl.transactionid AND kl.pid != bl.pid
+JOIN pg_stat_activity ka ON ka.pid = kl.pid
+WHERE NOT bl.granted;
+
+-- REPLICATION STATUS
+SELECT client_addr, state, sent_lsn, write_lsn, flush_lsn, replay_lsn,
+       write_lag, flush_lag, replay_lag
+FROM pg_stat_replication;
+
+-- AUTOVACUUM CHECK
+SELECT relname, n_dead_tup
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 1000
+ORDER BY n_dead_tup DESC
+LIMIT 10;
+
+-- INDEX USAGE
+SELECT relname AS table_name,
+       100 * idx_scan / (seq_scan + idx_scan + 1) AS idx_usage_percent,
+       n_live_tup AS rows_in_table
+FROM pg_stat_user_tables
+ORDER BY idx_usage_percent ASC
+LIMIT 10;
+
+-- TABLE BLOAT (ESTIMATE)
+SELECT schemaname, relname,
+       pg_size_pretty(pg_relation_size(relid)) AS table_size,
+       n_dead_tup
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 0
+ORDER BY n_dead_tup DESC
+LIMIT 10;
+
+-- TEMP FILE USAGE
+SELECT datname, temp_files, temp_bytes
+FROM pg_stat_database
+ORDER BY temp_bytes DESC
+LIMIT 10;
+
+-- CHECKPOINT & WAL
+SELECT * FROM pg_stat_bgwriter;
+
+-- HEAVY QUERIES (pg_stat_statements)
+SELECT userid, dbid, queryid, calls,
+       total_exec_time, rows,
+       (blk_read_time + blk_write_time) AS io_time
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
