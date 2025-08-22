@@ -86,5 +86,10 @@ ORDER BY total_exec_time DESC
 LIMIT 10;
 
 
+---Dead lock
+SELECT datname, deadlocks
+FROM pg_stat_database
+ORDER BY deadlocks DESC;
+
 
 ---aaa
