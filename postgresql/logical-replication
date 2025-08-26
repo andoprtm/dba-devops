@@ -1,0 +1,128 @@
+#postgres publisher(source) config
+listen_addresses = '*'
+port = 5432<sesuaikan kebutuhan port yang ada>
+wal_level = logical
+max_wal_senders = '64' <Untuk kebutuhan banyak database>
+max_replication_slots = '32' <Untuk kebutuhan banyak database>
+max_logical_replication_workers = '32'
+max_worker_processes = '32'
+logging_collector = on <OPTIONAL>
+log_filename = 'postgresql.log' <OPTIONAL>
+
+
+#set hba (source)
+host replication all xx.xx.xx.xx/xx  trust
+
+#set hba (target)
+host replication all xx.xx.xx.xx/xx  trust
+
+
+#set role untuk replicator
+CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'strong_password_here';
+
+#function reset sequence
+CREATE FUNCTION get_sequences()
+      RETURNS TABLE (
+        last_value bigint,
+        sequence_schema text,
+        sequence_name text
+      )
+      LANGUAGE plpgsql AS
+    $func$
+    DECLARE
+        s RECORD;
+    BEGIN
+        FOR s IN SELECT t.sequence_schema, t.sequence_name
+               FROM information_schema.sequences t
+        LOOP
+          RETURN QUERY EXECUTE format(
+              'SELECT last_value, ''%1$s''::text, ''%2$s''::text FROM %1$I.%2$I',
+              s.sequence_schema,
+              s.sequence_name
+          );
+        END LOOP;
+    END;
+    $func$;
+
+
+#dump schema & role
+pg_dumpall --roles-only --file=/xx/xx/xx/roles.sql -h 127.0.0.1 -p 5432 -U postgres
+
+pg_dump -Fp -s -h 127.0.0.1 -p 5432 xx > /xx/xx/xx/xx_xx_$(date +\%Y\%m\%d_%I\%M\%p).bak --verbose 2> /xx/xx/xx/xx_xx_$(date +\%Y\%m\%d_%I\%M\%p).log
+
+
+#create publisher
+CREATE PUBLICATION publisher_all_xx FOR ALL TABLES;
+
+
+#checking table PK
+-- Cari tabel tanpa PK
+SELECT t.table_schema,
+       t.table_name
+FROM information_schema.tables t
+LEFT JOIN information_schema.table_constraints tc
+       ON t.table_schema = tc.table_schema
+      AND t.table_name   = tc.table_name
+      AND tc.constraint_type = 'PRIMARY KEY'
+WHERE t.table_type = 'BASE TABLE'
+  AND t.table_schema NOT IN ('pg_catalog', 'information_schema')
+  AND tc.constraint_name IS NULL
+ORDER BY t.table_schema, t.table_name;
+
+# Generate alter table 
+SELECT 'ALTER TABLE '
+       || quote_ident(t.table_schema) || '.' || quote_ident(t.table_name)
+       || ' REPLICA IDENTITY FULL;'
+FROM information_schema.tables t
+LEFT JOIN information_schema.table_constraints tc
+       ON t.table_schema = tc.table_schema
+      AND t.table_name   = tc.table_name
+      AND tc.constraint_type = 'PRIMARY KEY'
+WHERE t.table_type = 'BASE TABLE'
+  AND t.table_schema NOT IN ('pg_catalog', 'information_schema')
+  AND tc.constraint_name IS NULL
+ORDER BY t.table_schema, t.table_name;
+
+
+#restore metadata & roles di target
+create database plnpusat
+
+psql -U postgres -p 5433 < /home/postgres/backup_database/all_roles.sql
+
+psql -p 5432 -U xx -d xx < /xx/xx/xx/xx.sql
+
+
+
+# create subscription (target)
+CREATE SUBSCRIPTION subsciber_all_xx CONNECTION 'dbname=xx
+host=127.0.0.1 user=postgres password=xxxx port=5432' PUBLICATION publisher_all_xx;
+#create logical rep hanya sampai sini.
+
+
+
+#------------Migration------------------
+# check archive
+CEK ARCHIVE APPLIED
+#source
+select current_time;
+select pg_current_wal_lsn();
+	
+#target
+select current_time;
+select subname,received_lsn, latest_end_lsn from pg_catalog.pg_stat_subscription;
+		
+#<<<<<untuk switch logfile di source>>>>		
+SELECT pg_switch_wal();
+
+
+#reset sequence
+#source
+SELECT sequence_schema,sequence_name,last_value FROM get_sequences() order by sequence_schema,sequence_name;
+
+#hasil select berikut jalankan pada target
+SELECT 'ALTER SEQUENCE ' || sequence_schema||'.'|| sequence_name || ' RESTART WITH ' || last_value + 1 || ';'
+FROM get_sequences() order by sequence_schema,sequence_name; 
+
+
+#stop subscription
+ALTER SUBSCRIPTION subscriber_all_xx DISABLE;
