@@ -1,0 +1,57 @@
+#!/bin/sh
+
+# ================== CONFIG ==================
+PG_HOST="xx.xx.xx.xx" #kalo dari local make localhost aja
+PG_PORT="xxxx"
+PG_USER="postgres"
+DB_NAME="xxxx"  
+BACKUP_DIR="/xx/xx/"
+LOG_DIR="/xx/xx/"
+RETENTION_DAYS=7  # retention backup
+#============================================
+TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+BACKUP_FILE="${BACKUP_DIR}/full_backup_${DB_NAME}_${TIMESTAMP}.sql"
+LOG_FILE="${LOG_DIR}/backup_log_${DB_NAME}_${TIMESTAMP}.log"
+
+# Create directories if not exist
+mkdir -p "$BACKUP_DIR" "$LOG_DIR"
+
+# Function to get current timestamp
+get_timestamp() {
+    date +"%Y-%m-%d %T"
+}
+
+# Function to handle backup
+backup_all() {
+    ts=$(get_timestamp)
+    echo "[$ts] ---- START OF BACKUP ----" >> "$LOG_FILE"
+    # Dump database to file first
+    if ! pg_dumpall -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" --verbose > "$BACKUP_FILE" 2>> "$LOG_FILE"; then
+        ts=$(get_timestamp)
+        echo "[$ts] ---- BACKUP FAILED ----" >> "$LOG_FILE"
+        exit 1
+    fi
+    ts=$(get_timestamp)
+    echo "[$ts] ---- END OF BACKUP ----" >> "$LOG_FILE"
+    echo "[$ts] Backup successful" >> "$LOG_FILE"
+}
+
+# Disk usage check (basic)
+check_disk() {
+    ts=$(get_timestamp)
+    echo "[$ts] ---- DISK USAGE ----" >> "$LOG_FILE"
+    df -kh "$BACKUP_DIR" >> "$LOG_FILE"
+}
+
+# Cleanup old backups
+cleanup_old_backups() {
+    ts=$(get_timestamp)
+    echo "[$ts] ---- CLEANUP OLD BACKUPS (> ${RETENTION_DAYS} days) ----" >> "$LOG_FILE"
+    find "$BACKUP_DIR" -iname "full_backup_${DB_NAME}_*" -daystart -mtime +$RETENTION_DAYS -exec ls -altrh {} \; >> "$LOG_FILE"
+    find "$BACKUP_DIR" -iname "full_backup_${DB_NAME}_*" -daystart -mtime +$RETENTION_DAYS -exec rm -f {} \;
+}
+
+# ================== RUN ==================
+check_disk
+backup_all
+cleanup_old_backups
