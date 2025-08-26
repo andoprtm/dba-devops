@@ -5,7 +5,7 @@ SMTP_SERVER="10.14.20.164"
 SMTP_PORT=25
 EMAIL_FROM="backup-korporat@iconpln.co.id"
 EMAIL_TO="ando.wibawa@iconpln.co.id"
-SUBJECT="[Backup Report] Weekly backup report"
+SUBJECT="[Backup Report] Weekly backup report for pgBackrest"
 TIMEZONE="Asia/Jakarta"
 
 # ============== FUNCTIONS ===================
