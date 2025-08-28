@@ -19,6 +19,11 @@ SELECT datname,
 FROM pg_stat_database
 ORDER BY cache_hit_ratio ASC;
 
+-- Cek extension
+SELECT name, default_version, installed_version
+FROM pg_available_extensions
+ORDER BY name;
+
 -- LONG RUNNING QUERIES (>5min)
 SELECT pid, usename, state, query, now() - query_start AS duration
 FROM pg_stat_activity
@@ -38,6 +43,18 @@ JOIN pg_stat_activity a ON a.pid = bl.pid
 JOIN pg_locks kl ON kl.transactionid = bl.transactionid AND kl.pid != bl.pid
 JOIN pg_stat_activity ka ON ka.pid = kl.pid
 WHERE NOT bl.granted;
+
+-- KILL CONNECTION (DROP)
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = 'nama_db' 
+  AND pid <> pg_backend_pid();
+
+-- KILL ALL 
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE pid <> pg_backend_pid();
+
 
 -- REPLICATION STATUS
 SELECT client_addr, state, sent_lsn, write_lsn, flush_lsn, replay_lsn,
