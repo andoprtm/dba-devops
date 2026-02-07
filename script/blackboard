@@ -2,3 +2,8 @@ SELECT @@version;
 SHOW VARIABLES LIKE 'version%';
 sudo mariadb-upgrade --force -u root -p
 sudo systemctl restart mariadb
+
+
+
+
+sudo grep -R "socket" /etc/systemd/system/mariadb_11.service /etc/my.cnf* /etc/mysql* 2>/dev/null
