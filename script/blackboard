@@ -1,2 +1,4 @@
 SELECT @@version;
 SHOW VARIABLES LIKE 'version%';
+sudo mariadb-upgrade --force -u root -p
+sudo systemctl restart mariadb
