@@ -1,1 +1,2 @@
-
+SELECT @@version;
+SHOW VARIABLES LIKE 'version%';
