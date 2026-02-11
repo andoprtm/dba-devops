@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# MariaDB -> PostgreSQL Migration Script (pgloader)
+# Purpose: Staging/Repeatable migration with logging + validation
+# ============================================================
+
+# -----------------------------
+# CONFIG SECTION
+# -----------------------------
+MARIADB_HOST="10.10.10.10"
+MARIADB_PORT="3306"
+MARIADB_USER="root"
+MARIADB_PASS="welcome1"
+MARIADB_DB="appdb"
+
+PG_HOST="10.10.10.20"
+PG_PORT="5432"
+PG_ADMIN_USER="postgres"        # PostgreSQL admin user
+PG_TARGET_DB="appdb"            # target DB name
+PG_MIG_USER="migrator"
+PG_MIG_PASS="welcome1"
+
+# If true, script will DROP and recreate database every run
+RESET_TARGET_DB="yes"
+
+# Log folder
+LOG_DIR="./migration_logs"
+
+# -----------------------------
+# INTERNAL VARIABLES (DO NOT EDIT)
+# -----------------------------
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+RUN_LOG="${LOG_DIR}/migration_run_${TIMESTAMP}.log"
+PGLOADER_LOG="${LOG_DIR}/pgloader_${TIMESTAMP}.log"
+VALIDATION_LOG="${LOG_DIR}/validation_${TIMESTAMP}.log"
+LOAD_FILE="${LOG_DIR}/mariadb_to_pg_${TIMESTAMP}.load"
+
+# -----------------------------
+# FUNCTIONS
+# -----------------------------
+die() {
+  echo "[ERROR] $*" | tee -a "$RUN_LOG"
+  exit 1
+}
+
+check_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Command not found: $1"
+}
+
+# -----------------------------
+# START
+# -----------------------------
+mkdir -p "$LOG_DIR"
+
+echo "===================================================" | tee -a "$RUN_LOG"
+echo " MariaDB -> PostgreSQL Migration using pgloader"     | tee -a "$RUN_LOG"
+echo " Timestamp: $TIMESTAMP"                             | tee -a "$RUN_LOG"
+echo "===================================================" | tee -a "$RUN_LOG"
+
+echo "[INFO] Checking required commands..." | tee -a "$RUN_LOG"
+check_command pgloader
+check_command mysql
+check_command psql
+
+echo "[INFO] Testing MariaDB connectivity..." | tee -a "$RUN_LOG"
+mysql -h "$MARIADB_HOST" -P "$MARIADB_PORT" -u "$MARIADB_USER" -p"$MARIADB_PASS" \
+  -e "SELECT 1;" >/dev/null 2>&1 || die "Cannot connect to MariaDB server"
+
+echo "[INFO] Testing PostgreSQL connectivity..." | tee -a "$RUN_LOG"
+psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_ADMIN_USER" -c "SELECT 1;" >/dev/null 2>&1 \
+  || die "Cannot connect to PostgreSQL server"
+
+echo "[INFO] Checking MariaDB database exists..." | tee -a "$RUN_LOG"
+mysql -h "$MARIADB_HOST" -P "$MARIADB_PORT" -u "$MARIADB_USER" -p"$MARIADB_PASS" \
+  -e "SHOW DATABASES LIKE '${MARIADB_DB}';" | grep -q "$MARIADB_DB" \
+  || die "MariaDB database does not exist: $MARIADB_DB"
+
+# -----------------------------
+# RESET TARGET DATABASE (OPTIONAL)
+# -----------------------------
+if [[ "$RESET_TARGET_DB" == "yes" ]]; then
+  echo "[INFO] Resetting PostgreSQL target database..." | tee -a "$RUN_LOG"
+
+  psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_ADMIN_USER" <<EOF >>"$RUN_LOG" 2>&1
+DROP DATABASE IF EXISTS ${PG_TARGET_DB};
+CREATE DATABASE ${PG_TARGET_DB};
+
+DO \$\$
+BEGIN
+   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${PG_MIG_USER}') THEN
+      CREATE ROLE ${PG_MIG_USER} LOGIN PASSWORD '${PG_MIG_PASS}';
+   END IF;
+END
+\$\$;
+
+GRANT ALL PRIVILEGES ON DATABASE ${PG_TARGET_DB} TO ${PG_MIG_USER};
+EOF
+
+  psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_ADMIN_USER" -d "$PG_TARGET_DB" <<EOF >>"$RUN_LOG" 2>&1
+GRANT ALL ON SCHEMA public TO ${PG_MIG_USER};
+ALTER SCHEMA public OWNER TO ${PG_MIG_USER};
+EOF
+fi
+
+# -----------------------------
+# CREATE PGLOADER LOAD FILE
+# -----------------------------
+echo "[INFO] Creating pgloader load file: $LOAD_FILE" | tee -a "$RUN_LOG"
+
+cat > "$LOAD_FILE" <<EOF
+LOAD DATABASE
+     FROM mysql://${MARIADB_USER}:${MARIADB_PASS}@${MARIADB_HOST}:${MARIADB_PORT}/${MARIADB_DB}
+     INTO postgresql://${PG_MIG_USER}:${PG_MIG_PASS}@${PG_HOST}:${PG_PORT}/${PG_TARGET_DB}
+
+ WITH include drop,
+      create tables,
+      create indexes,
+      reset sequences,
+      foreign keys
+
+ SET maintenance_work_mem to '512MB',
+     work_mem to '64MB'
+
+ CAST type datetime to timestamp,
+      type date to date,
+      type tinyint to smallint
+
+ BEFORE LOAD DO
+ $$ CREATE SCHEMA IF NOT EXISTS public; $$;
+EOF
+
+# -----------------------------
+# RUN PGLOADER
+# -----------------------------
+echo "[INFO] Running pgloader migration..." | tee -a "$RUN_LOG"
+pgloader "$LOAD_FILE" >"$PGLOADER_LOG" 2>&1 || die "pgloader failed. Check log: $PGLOADER_LOG"
+echo "[INFO] pgloader completed successfully." | tee -a "$RUN_LOG"
+
+# -----------------------------
+# FIX SEQUENCES
+# -----------------------------
+echo "[INFO] Fixing PostgreSQL sequences (AUTO_INCREMENT alignment)..." | tee -a "$RUN_LOG"
+
+psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_ADMIN_USER" -d "$PG_TARGET_DB" <<'EOF' >>"$RUN_LOG" 2>&1
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN
+        SELECT
+            pg_get_serial_sequence(format('%I.%I', schemaname, tablename), columnname) AS seq,
+            format('%I.%I', schemaname, tablename) AS tbl,
+            columnname AS col
+        FROM pg_catalog.pg_statio_all_tables st
+        JOIN pg_catalog.pg_attribute a
+          ON a.attrelid = st.relid
+        JOIN pg_catalog.pg_attrdef d
+          ON d.adrelid = st.relid AND d.adnum = a.attnum
+        WHERE schemaname = 'public'
+          AND a.attnum > 0
+          AND pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval%'
+    LOOP
+        EXECUTE format(
+            'SELECT setval(%L, COALESCE((SELECT MAX(%I) FROM %s), 1), true);',
+            r.seq, r.col, r.tbl
+        );
+    END LOOP;
+END $$;
+EOF
+
+# -----------------------------
+# VACUUM ANALYZE
+# -----------------------------
+echo "[INFO] Running VACUUM ANALYZE..." | tee -a "$RUN_LOG"
+psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_ADMIN_USER" -d "$PG_TARGET_DB" -c "VACUUM ANALYZE;" >>"$RUN_LOG" 2>&1
+
+# -----------------------------
+# VALIDATION REPORT
+# -----------------------------
+echo "[INFO] Generating validation report..." | tee -a "$RUN_LOG"
+
+{
+  echo "=================================================="
+  echo "VALIDATION REPORT"
+  echo "Timestamp: $TIMESTAMP"
+  echo "=================================================="
+  echo
+  echo "---- MariaDB Table Counts (approx) ----"
+  mysql -h "$MARIADB_HOST" -P "$MARIADB_PORT" -u "$MARIADB_USER" -p"$MARIADB_PASS" -e "
+  SELECT table_name, table_rows
+  FROM information_schema.tables
+  WHERE table_schema='${MARIADB_DB}'
+  ORDER BY table_rows DESC;"
+  echo
+  echo "---- PostgreSQL Table Counts (approx) ----"
+  psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_MIG_USER" -d "$PG_TARGET_DB" -c "
+  SELECT relname AS table, n_live_tup AS rows
+  FROM pg_stat_user_tables
+  ORDER BY n_live_tup DESC;"
+  echo
+  echo "---- PostgreSQL Foreign Keys ----"
+  psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_MIG_USER" -d "$PG_TARGET_DB" -c "
+  SELECT conname, conrelid::regclass AS table_name
+  FROM pg_constraint
+  WHERE contype='f'
+  ORDER BY table_name;"
+} > "$VALIDATION_LOG" 2>&1
+
+# -----------------------------
+# SUMMARY
+# -----------------------------
+echo "===================================================" | tee -a "$RUN_LOG"
+echo " Migration Completed Successfully!"                 | tee -a "$RUN_LOG"
+echo "===================================================" | tee -a "$RUN_LOG"
+echo "Run Log        : $RUN_LOG"                         | tee -a "$RUN_LOG"
+echo "pgloader Log   : $PGLOADER_LOG"                    | tee -a "$RUN_LOG"
+echo "Validation Log : $VALIDATION_LOG"                  | tee -a "$RUN_LOG"
+echo "Load File      : $LOAD_FILE"                       | tee -a "$RUN_LOG"
+echo "===================================================" | tee -a "$RUN_LOG"
